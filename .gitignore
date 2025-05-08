@@ -1,0 +1,14 @@
+# Ignore build artifacts
+ascii_cam_opencv
+*.o
+
+# Backup and swap files
+*~
+*.swp
+
+# macOS
+.DS_Store
+
+# Editor directories
+.vscode/
+.idea/
