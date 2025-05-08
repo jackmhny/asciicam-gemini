@@ -140,7 +140,7 @@ int detect_faces_opencv(const unsigned char* yuyv_pixel_data, int cam_width, int
 
     // 2. Convert YUYV to BGR, then to Grayscale for detection
     try {
-        cv::cvtColor(yuyv_mat, bgr_mat, cv::COLOR_YUV2BGR_YUY2);
+        cv::cvtColor(yuyv_mat, bgr_mat, cv::COLOR_YUV2BGR_YUY2); // Or COLOR_YUV2BGR_YUYV
         cv::cvtColor(bgr_mat, gray_mat, cv::COLOR_BGR2GRAY);
     } catch (const cv::Exception& e) {
         fprintf(stderr, "OpenCV conversion error: %s\n", e.what());
@@ -154,7 +154,12 @@ int detect_faces_opencv(const unsigned char* yuyv_pixel_data, int cam_width, int
     // 4. Detect faces
     std::vector<cv::Rect> faces_cv;
     // Adjust parameters as needed: scaleFactor, minNeighbors, flags, minSize
-    face_cascade.detectMultiScale(gray_mat, faces_cv, 1.1, 3, 0 | cv::CASCADE_SCALE_IMAGE, cv::Size(30 * cam_width / DEFAULT_CAPTURE_WIDTH, 30 * cam_height / DEFAULT_CAPTURE_HEIGHT));
+    // Using relative minSize based on capture dimensions
+    double min_face_size_ratio = 0.05; // e.g., face should be at least 5% of image height
+    int min_face_dim = (int)(std::min(cam_width, cam_height) * min_face_size_ratio);
+    if (min_face_dim < 20) min_face_dim = 20; // Absolute minimum
+
+    face_cascade.detectMultiScale(gray_mat, faces_cv, 1.1, 4, 0 | cv::CASCADE_SCALE_IMAGE, cv::Size(min_face_dim, min_face_dim));
 
 
     // 5. Convert OpenCV Rects to our FaceRectangle format and scale to terminal coordinates
@@ -187,11 +192,10 @@ int detect_faces_opencv(const unsigned char* yuyv_pixel_data, int cam_width, int
             faces_output_buffer[num_detected].height = term_height - faces_output_buffer[num_detected].y;
         }
 
-
         if (faces_output_buffer[num_detected].width > 0 && faces_output_buffer[num_detected].height > 0) {
              num_detected++;
         } else {
-            faces_output_buffer[num_detected].active = false;
+            faces_output_buffer[num_detected].active = false; // Mark as inactive if dimensions are zero/negative
         }
     }
     return num_detected;
@@ -213,11 +217,16 @@ static int init_device_video(int capture_width, int capture_height) {
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width       = capture_width;
     fmt.fmt.pix.height      = capture_height;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV; // Request YUYV
     fmt.fmt.pix.field       = V4L2_FIELD_ANY;
 
     if (xioctl(fd_video, VIDIOC_S_FMT, &fmt) == -1) { perror("VIDIOC_S_FMT"); close(fd_video); return -1; }
-    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) { fprintf(stderr, "YUYV not accepted\n"); close(fd_video); return -1; }
+    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) { // Check if YUYV was actually set
+        fprintf(stderr, "YUYV format not accepted by driver. Current format: %c%c%c%c\n",
+                (fmt.fmt.pix.pixelformat & 0xFF), (fmt.fmt.pix.pixelformat >> 8) & 0xFF,
+                (fmt.fmt.pix.pixelformat >> 16) & 0xFF, (fmt.fmt.pix.pixelformat >> 24) & 0xFF);
+        close(fd_video); return -1;
+    }
 
     memset(&req, 0, sizeof(req));
     req.count = BUFFER_COUNT;
@@ -259,8 +268,11 @@ static int start_capturing() {
     return 0;
 }
 
-static void process_frame_display(const unsigned char *frame_pixel_data, int cam_width, int cam_height, int bytes_per_line,
-                                  int term_width, int term_height, const FaceRectangle* faces, int num_faces) {
+// Corrected declaration to match expected arguments
+static void process_frame_display(const unsigned char *frame_pixel_data, /* int frame_size_bytes - REMOVED */
+                                  int cam_width, int cam_height, int bytes_per_line,
+                                  int term_width, int term_height,
+                                  const FaceRectangle* faces, int num_faces) {
     printf("\033[2J\033[H"); // Clear screen, cursor to home
 
     float step_x = (term_width > 0) ? (float)cam_width / term_width : cam_width;
@@ -271,12 +283,13 @@ static void process_frame_display(const unsigned char *frame_pixel_data, int cam
             bool is_on_face_box_border = false;
             for (int k = 0; k < num_faces; ++k) {
                 if (faces[k].active && faces[k].width > 0 && faces[k].height > 0) {
-                    bool on_horizontal = (i >= faces[k].y && i < faces[k].y + SIM_FACE_BOX_THICKNESS && j >= faces[k].x && j < faces[k].x + faces[k].width) ||
-                                         (i < faces[k].y + faces[k].height && i >= faces[k].y + faces[k].height - SIM_FACE_BOX_THICKNESS && j >= faces[k].x && j < faces[k].x + faces[k].width);
-                    bool on_vertical   = (j >= faces[k].x && j < faces[k].x + SIM_FACE_BOX_THICKNESS && i >= faces[k].y && i < faces[k].y + faces[k].height) ||
-                                         (j < faces[k].x + faces[k].width && j >= faces[k].x + faces[k].width - SIM_FACE_BOX_THICKNESS && i >= faces[k].y && i < faces[k].y + faces[k].height);
+                    // Check if (j,i) is on the border of faces[k] rectangle
+                    bool on_horizontal_border = (i >= faces[k].y && i < faces[k].y + SIM_FACE_BOX_THICKNESS && j >= faces[k].x && j < faces[k].x + faces[k].width) ||
+                                                (i < faces[k].y + faces[k].height && i >= faces[k].y + faces[k].height - SIM_FACE_BOX_THICKNESS && j >= faces[k].x && j < faces[k].x + faces[k].width);
+                    bool on_vertical_border   = (j >= faces[k].x && j < faces[k].x + SIM_FACE_BOX_THICKNESS && i >= faces[k].y && i < faces[k].y + faces[k].height) ||
+                                                (j < faces[k].x + faces[k].width && j >= faces[k].x + faces[k].width - SIM_FACE_BOX_THICKNESS && i >= faces[k].y && i < faces[k].y + faces[k].height);
                     
-                    if (on_horizontal || on_vertical) {
+                    if (on_horizontal_border || on_vertical_border) {
                         is_on_face_box_border = true;
                         break;
                     }
@@ -315,7 +328,7 @@ static void main_loop(int term_width, int term_height) {
     int actual_cam_height = fmt.fmt.pix.height;
     int actual_bytes_per_line = fmt.fmt.pix.bytesperline;
     if (actual_bytes_per_line == 0 && fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV) {
-        actual_bytes_per_line = actual_cam_width * 2;
+        actual_bytes_per_line = actual_cam_width * 2; // For YUYV, it's width * 2 bytes/pixel
     }
     if (actual_bytes_per_line == 0) { fprintf(stderr, "Could not get bytes_per_line\n"); return; }
 
@@ -326,10 +339,11 @@ static void main_loop(int term_width, int term_height) {
         buf.memory = V4L2_MEMORY_MMAP;
 
         if (xioctl(fd_video, VIDIOC_DQBUF, &buf) == -1) {
-            if (errno == EAGAIN) { usleep(10000); continue; }
+            if (errno == EAGAIN) { usleep(10000); continue; } // No buffer ready, try again
             perror("VIDIOC_DQBUF"); break;
         }
 
+        // Perform face detection
         int num_faces_found = detect_faces_opencv(
             (const unsigned char*)buffers[buf.index].start,
             actual_cam_width, actual_cam_height,
@@ -337,12 +351,15 @@ static void main_loop(int term_width, int term_height) {
             detected_terminal_faces, MAX_FACES_TO_DRAW
         );
 
-        process_frame_display((const unsigned char*)buffers[buf.index].start, buf.bytesused, actual_cam_width, actual_cam_height, actual_bytes_per_line,
+        // Display the frame with detected faces
+        // CORRECTED CALL: Removed buf.bytesused
+        process_frame_display((const unsigned char*)buffers[buf.index].start,
+                              actual_cam_width, actual_cam_height, actual_bytes_per_line,
                               term_width, term_height, detected_terminal_faces, num_faces_found);
 
         if (xioctl(fd_video, VIDIOC_QBUF, &buf) == -1) { perror("VIDIOC_QBUF"); break; }
-        usleep(66000); // Approx 15 FPS to give more time for OpenCV processing
-                       // Adjust based on your system's performance
+        usleep(66000); // Approx 15 FPS. Adjust based on performance.
+                       // Face detection is CPU intensive.
     }
 }
 
@@ -355,7 +372,7 @@ static void stop_capturing() {
 
 static void uninit_device_video() {
     if (buffers) {
-        for (unsigned int i = 0; i < BUFFER_COUNT; ++i) { // Assuming BUFFER_COUNT was the number requested
+        for (unsigned int i = 0; i < BUFFER_COUNT; ++i) { 
             if (buffers[i].start && buffers[i].start != MAP_FAILED) {
                 munmap(buffers[i].start, buffers[i].length);
             }
@@ -369,11 +386,12 @@ void get_terminal_dimensions(int *width, int *height) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
         *width = ws.ws_col;
-        *height = ws.ws_row -1; 
-        if (*height <=0) *height = 1;
+        *height = ws.ws_row -1; // Use one less row to avoid issues with prompt
+        if (*height <=0) *height = 1; // Ensure at least 1 row
     } else {
-        perror("TIOCGWINSZ failed, using defaults");
-        *width = 80; *height = 24;
+        perror("TIOCGWINSZ failed or returned invalid dimensions, using defaults");
+        *width = 80;  // Default width
+        *height = 24; // Default height
     }
 }
 
@@ -401,7 +419,7 @@ int main(int argc, char **argv) {
     get_terminal_dimensions(&TERM_OUTPUT_WIDTH, &TERM_OUTPUT_HEIGHT);
     printf("Detected terminal: %d cols, %d rows for video.\n", TERM_OUTPUT_WIDTH, TERM_OUTPUT_HEIGHT);
     printf("Attempting to use OpenCV for face detection.\n");
-    sleep(2);
+    sleep(2); // Give user time to read messages
 
     if (init_device_video(DEFAULT_CAPTURE_WIDTH, DEFAULT_CAPTURE_HEIGHT) == -1) {
         fprintf(stderr, "Device initialization failed.\n");
